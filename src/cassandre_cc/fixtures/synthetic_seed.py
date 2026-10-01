@@ -285,7 +285,7 @@ def seed(store: MemoryStore) -> MemoryStore:
         ApprovalCase(
             case_id="SIM-CASE-A001-RULEV3",
             subject_type="rule_version",
-            subject_id="SIM-RULE-A001-V3-PROPOSED",
+            subject_id="SIM-RULE-A001-V2",
             submitted_by="maker.priya",
         )
     )

@@ -26,3 +26,24 @@ def test_value_far_below_threshold_is_potential_breach():
 
 def test_value_just_at_threshold_is_near_threshold_not_silently_compliant():
     assert evaluate_covenant(Decimal("0.05"), _TEST) is FindingState.NEAR_THRESHOLD
+
+
+def test_failed_minimum_inside_warning_band_is_still_potential_breach():
+    assert evaluate_covenant(Decimal("0.049"), _TEST) is FindingState.POTENTIAL_BREACH
+
+
+def test_failed_maximum_inside_warning_band_is_still_potential_breach():
+    from dataclasses import replace
+    maximum = replace(_TEST, comparator=Comparator.AT_MOST)
+    assert evaluate_covenant(Decimal("0.051"), maximum) is FindingState.POTENTIAL_BREACH
+
+
+def test_waiver_applies_to_failed_value_inside_warning_band():
+    from cassandre_cc.calculations.covenant import evaluate_covenant_with_waiver
+    assert evaluate_covenant_with_waiver(Decimal("0.049"), _TEST, True) is FindingState.WAIVED_FOR_SCOPE
+
+
+def test_nonfinite_covenant_value_rejected():
+    import pytest
+    with pytest.raises(ValueError, match="finite"):
+        evaluate_covenant(Decimal("NaN"), _TEST)

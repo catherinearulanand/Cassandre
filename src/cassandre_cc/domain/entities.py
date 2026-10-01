@@ -196,3 +196,24 @@ class AuditEvent:
     action: str
     detail: str
     occurred_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass(frozen=True)
+class CalculationRun:
+    """Immutable replay record: exact inputs, selected terms and derived output.
+
+    JSON values are canonical strings so later in-memory record replacements
+    cannot alter this run. A local checksum is not an independent audit anchor.
+    """
+    run_id: str
+    institution_id: str
+    facility_id: str
+    period: Optional[str]
+    actor: str
+    inputs_json: str
+    rule_json: str
+    result_json: str
+    source_batch_ids: tuple[str, ...]
+    payload_sha256: str
+    engine_version: str = "cc-deterministic-0.3"
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

@@ -57,6 +57,16 @@ def evaluate_covenant(value: Optional[Decimal], test: CovenantTest) -> FindingSt
     if value is None:
         return FindingState.INDETERMINATE
 
+    for name, number in (("value", value), ("threshold", test.threshold), ("near_threshold_band", test.near_threshold_band)):
+        if not isinstance(number, Decimal):
+            raise TypeError(f"{name} must be Decimal")
+        if not number.is_finite():
+            raise ValueError(f"{name} must be finite")
+    if not Decimal("0") <= test.near_threshold_band <= Decimal("1"):
+        raise ValueError("near_threshold_band must be between zero and one")
+    if not isinstance(test.comparator, Comparator):
+        raise ValueError("unsupported covenant comparator")
+
     band_width = abs(test.threshold) * test.near_threshold_band
 
     if test.comparator is Comparator.AT_LEAST:
@@ -66,6 +76,9 @@ def evaluate_covenant(value: Optional[Decimal], test: CovenantTest) -> FindingSt
         passes = value <= test.threshold
         distance = test.threshold - value
 
-    if abs(distance) <= band_width:
+    # A warning band never overrides the actual contractual boundary.
+    if not passes:
+        return FindingState.POTENTIAL_BREACH
+    if distance <= band_width:
         return FindingState.NEAR_THRESHOLD
     return FindingState.COMPLIANT if passes else FindingState.POTENTIAL_BREACH

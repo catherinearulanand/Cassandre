@@ -1,15 +1,16 @@
-"""JSON snapshot persistence for `MemoryStore`.
+"""Atomic, checksummed local snapshot persistence. Single process only.
 
-Not a real database — no migrations, no concurrent-writer safety, no
-indexes, single file on local disk. It does close the most visible gap from
-docs/ASSUMPTIONS.md item 1 ("resets on every restart"): state now survives
-a process restart. A real Postgres-backed store is still the documented
-next step, not this.
+The checksum detects accidental corruption, not malicious authorised writes.
+This is not an encrypted database or independent tamper-evident audit store.
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import tempfile
+import contextvars
 import typing
 from dataclasses import asdict, fields
 from datetime import date, datetime
@@ -21,6 +22,7 @@ from cassandre_cc.domain.entities import (
     AuditEvent,
     Borrower,
     ClosureChecklist,
+    CalculationRun,
     CureTask,
     DocumentRef,
     EligibilityRuleSet,
@@ -44,6 +46,8 @@ _COLLECTION_TYPES: dict[str, type] = {
     "evidence_items": EvidenceItem,
     "rule_sets": EligibilityRuleSet,
     "financials": FacilityFinancials,
+    "financials_history": FacilityFinancials,
+    "calculation_runs": CalculationRun,
     "approval_cases": ApprovalCase,
     "import_batches": ImportBatch,
     "waivers": Waiver,
@@ -65,6 +69,8 @@ def _encode(obj: Any) -> Any:
 def _convert_value(value: Any, hint: Any) -> Any:
     if value is None:
         return None
+    if typing.get_origin(hint) is tuple:
+        return tuple(value)
     origin = typing.get_origin(hint)
     if origin is typing.Union:
         args = [a for a in typing.get_args(hint) if a is not type(None)]
@@ -84,20 +90,75 @@ def _dataclass_from_dict(cls: type, data: dict) -> Any:
     return cls(**kwargs)
 
 
-def save(store: MemoryStore, path: Path) -> None:
-    payload: dict[str, Any] = {
+# Saves inside a request are deferred until its response has been validated.
+_deferred = contextvars.ContextVar("snapshot_deferred", default=False)
+
+
+class PersistenceError(RuntimeError):
+    """Snapshot is invalid or cannot be committed; never silently reseed."""
+
+
+def payload_for(store: MemoryStore) -> dict[str, Any]:
+    payload = {
         name: {key: asdict(value) for key, value in getattr(store, name).items()}
         for name in _COLLECTION_TYPES
     }
     payload["audit_events"] = [asdict(e) for e in store.audit_events]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, default=_encode, indent=2), encoding="utf-8")
+    return json.loads(json.dumps(payload, default=_encode, allow_nan=False))
+
+
+def _canonical(payload: dict) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def save(store: MemoryStore, path: Path, *, force: bool = False) -> None:
+    if _deferred.get() and not force:
+        return
+    payload = payload_for(store)
+    envelope = {"schema_version": 2, "sha256": hashlib.sha256(_canonical(payload)).hexdigest(),
+                "payload": payload}
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temp_path = None
+    try:
+        # Same directory guarantees rename remains on one filesystem.
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".snapshot-", delete=False) as f:
+            temp_path = Path(f.name)
+            os.chmod(temp_path, 0o600)
+            f.write(_canonical(envelope))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+        # Ensure rename is durable on local POSIX filesystems.
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except (OSError, ValueError, TypeError) as exc:
+        raise PersistenceError("Snapshot commit failed") from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def load(path: Path) -> Optional[MemoryStore]:
     if not path.is_file():
         return None
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if "schema_version" in raw:
+            if raw["schema_version"] not in (1, 2):
+                raise ValueError("Unsupported snapshot schema")
+            payload = raw["payload"]
+            if hashlib.sha256(_canonical(payload)).hexdigest() != raw["sha256"]:
+                raise ValueError("Snapshot checksum mismatch")
+            raw = payload
+        # Legacy snapshots are read once; the next save upgrades the envelope.
+        if not isinstance(raw, dict) or any(name not in raw for name in _COLLECTION_TYPES if name not in {"financials_history", "calculation_runs"}):
+            raise ValueError("Incomplete snapshot")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise PersistenceError("Snapshot cannot be loaded; restore a verified backup") from exc
     store = MemoryStore()
     for name, cls in _COLLECTION_TYPES.items():
         setattr(

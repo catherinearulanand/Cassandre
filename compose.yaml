@@ -1,0 +1,36 @@
+services:
+  cassandre:
+    image: cassandre-cc:local
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12.13-slim-bookworm}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - cassandre_data:/data
+    environment:
+      CASSANDRE_CC_STORE_PATH: /data/store_snapshot.json
+      CASSANDRE_AUTH_FILE: /run/secrets/auth.json
+    secrets:
+      - source: auth
+        target: auth.json
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+    networks: [isolated]
+volumes:
+  cassandre_data:
+secrets:
+  auth:
+    file: ./secrets/auth.json
+networks:
+  isolated:
+    internal: true

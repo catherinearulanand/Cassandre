@@ -44,6 +44,13 @@ class Money:
         if not isinstance(self.amount, Decimal):
             raise TypeError(f"Money.amount must be Decimal, got {type(self.amount).__name__}")
 
+        if not self.amount.is_finite():
+            raise ValueError("Money.amount must be finite")
+        if not isinstance(self.unit, Unit):
+            raise TypeError("Money.unit must be an explicit Unit")
+        if not isinstance(self.currency, str) or not self.currency.strip():
+            raise ValueError("Money.currency must be specified")
+
     def to_rupees(self) -> Decimal:
         return self.amount * _TO_RUPEES[self.unit]
 

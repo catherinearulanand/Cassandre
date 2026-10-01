@@ -4,7 +4,7 @@ not real file storage or OCR (explicitly deferred, see docs/STATUS.md)."""
 
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
+from auth_client import TestClient
 
 from cassandre_cc.api.main import app
 

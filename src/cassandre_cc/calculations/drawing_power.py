@@ -60,6 +60,26 @@ def calculate_drawing_power(inputs: DPInputs) -> DPResult:
     if missing:
         return DPResult(state=DPResultState.INDETERMINATE, missing_fields=missing)
 
+    # Bad evidence must never become an apparently valid negative borrowing base.
+    money_fields = [f for f in _REQUIRED_FIELDS if f not in ("stock_margin", "receivable_margin")]
+    for field in money_fields:
+        value = getattr(inputs, field)
+        if not isinstance(value, Money):
+            raise TypeError(f"{field} must be Money")
+        inputs.reported_stock._check_compatible(value)
+        if value.amount < 0:
+            raise ValueError(f"{field} cannot be negative; normalise ledger signs explicitly")
+    for field in ("stock_margin", "receivable_margin"):
+        value = getattr(inputs, field)
+        if not isinstance(value, Decimal):
+            raise TypeError(f"{field} must be Decimal")
+        if not value.is_finite() or not Decimal("0") <= value <= Decimal("1"):
+            raise ValueError(f"{field} must be finite and between zero and one")
+    if inputs.stock_exclusions > inputs.reported_stock:
+        raise ValueError("stock exclusions exceed reported stock; reconcile evidence")
+    if inputs.receivable_exclusions > inputs.reported_receivables:
+        raise ValueError("receivable exclusions exceed reported receivables; reconcile evidence")
+
     eligible_stock = inputs.reported_stock - inputs.stock_exclusions
     eligible_receivables = inputs.reported_receivables - inputs.receivable_exclusions
 

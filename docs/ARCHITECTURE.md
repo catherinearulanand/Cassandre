@@ -61,3 +61,29 @@ exactly the kind of fast, connected-workflow iteration the user asked for.
 If/when this splits into genuinely independent products (per spec §13's own
 module list), the same package-per-module structure is already in place to
 promote into that pattern.
+
+## Durable evaluation runtime and production boundary
+
+The synthetic memory model now has checksummed atomic local snapshots,
+POSIX process writer leases and serialized rollback-capable request handling.
+Raw financial revisions and calculation runs have dedicated collections.
+These controls improve restart/replay correctness; they are not encrypted,
+independently tamper-evident or horizontally scalable database persistence.
+
+`store/transactions.py` buffers HTTP responses until the local commit and
+fails closed on storage errors. It rejects failed requests' partial changes.
+Only one worker and local POSIX storage are supported. Historical records
+must be treated as append-only by API code; a host operator can still alter
+snapshot data and recompute its checksum.
+
+Future database boundaries are concrete in `migrations/001_postgres_target.sql`
+(design-only, not executed): institution-composite references, decimal monetary
+values, evidence provenance, versioned rules, immutable input revisions and
+runs, independent maker/checker decisions, audit and transactional outbox.
+Repository replacement and PostgreSQL verification remain deferred. Keep
+calculation modules independent from storage and transport; do not split into
+network services merely to make the deployment look enterprise-scale.
+
+Deploy instructions, backup/recovery tests and exact limitations are in
+[ON_PREM.md](ON_PREM.md). Docker packaging is provided but cannot be claimed
+verified without a container engine and host security checks.

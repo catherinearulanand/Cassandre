@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cassandre CC — facility monitoring</title>
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,600;0,700;1,500&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header class="app-header">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 48 48" aria-hidden="true">
+      <circle cx="24" cy="24" r="22.5" fill="none" stroke="currentColor" stroke-width="1"/>
+      <path d="M24 10c-4.5 3.5-7 8-7 14s2.5 10.5 7 14c4.5-3.5 7-8 7-14s-2.5-10.5-7-14z" fill="none" stroke="currentColor" stroke-width="1"/>
+    </svg>
+    <span class="brand-word">Cassandré</span>
+    <span class="brand-sub">CC monitoring — simulation</span>
+  </div>
+  <div class="header-tag">
+    <span class="tag">All data simulated</span>
+    <span class="tag tag-role" id="role-tag">Viewing as: RM</span>
+  </div>
+</header>
+
+<div class="app-shell">
+
+  <nav class="facility-rail" id="facility-rail" aria-label="Facilities">
+    <p class="rail-label">Facilities</p>
+    <div id="facility-list" class="facility-list"></div>
+  </nav>
+
+  <main class="app-main" id="app-main">
+    <p class="loading">Loading facility…</p>
+  </main>
+
+</div>
+
+<template id="tpl-facility-detail">
+  <section class="facility-header">
+    <div>
+      <p class="eyebrow eyebrow-plain" data-field="external_ref"></p>
+      <h1 data-field="borrower_name"></h1>
+      <p class="facility-sub">
+        Sanctioned limit <strong data-field="sanctioned_limit"></strong> ·
+        <span class="state-chip" data-field="facility_state"></span> ·
+        <span class="shadow-score-badge" id="shadow-score-badge">shadow score —</span>
+      </p>
+    </div>
+    <div class="header-actions">
+      <label class="period-select-label">Period
+        <select id="period-select"></select>
+      </label>
+      <button class="btn btn-primary" id="recompute-btn">Recompute DP <span class="arrow">↻</span></button>
+    </div>
+  </section>
+
+  <section class="control-record" id="dp-record">
+    <div class="control-record-head">
+      <span>Drawing power — control record</span>
+      <span class="tag" data-field="period"></span>
+    </div>
+    <div class="control-record-state">
+      <div class="state-icon" id="dp-state-icon" aria-hidden="true"></div>
+      <div>
+        <p class="state-label">Result state</p>
+        <p class="state-value" data-field="result_state"></p>
+      </div>
+    </div>
+    <div id="dp-missing-banner" class="missing-banner" hidden>
+      <strong>Indeterminate:</strong> <span data-field="missing_fields"></span> not yet received/verified for this period.
+    </div>
+    <dl class="control-record-rows" id="dp-rows"></dl>
+    <p class="control-record-note">Every figure traces to its source evidence period and the approved rule-set version shown above; margins/exclusions are provisional placeholders (see docs/ASSUMPTIONS.md), not an approved bank formula.</p>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Evidence queue</h2>
+    </div>
+    <table class="data-table" id="evidence-table">
+      <thead><tr><th>Field</th><th>Period</th><th>State</th><th>Reviewer</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Import a period's financials</h2>
+    </div>
+    <form id="import-form" class="inline-form">
+      <input name="period" placeholder="2026-09" required />
+      <input name="reported_stock_crore" placeholder="reported stock (cr)" required />
+      <input name="stock_exclusions_crore" placeholder="stock exclusions (cr)" required />
+      <input name="reported_receivables_crore" placeholder="reported receivables (cr)" required />
+      <input name="receivable_exclusions_crore" placeholder="receivable exclusions (cr)" required />
+      <input name="outstanding_crore" placeholder="outstanding (cr)" required />
+      <button class="btn btn-small" type="submit">Import (idempotent)</button>
+    </form>
+    <div id="import-result" class="error-banner" hidden></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Rule-version history</h2>
+    </div>
+    <table class="data-table" id="rule-versions-table">
+      <thead><tr><th>Version</th><th>Margins (stock / recv)</th><th>Ageing cutoff</th><th>Effective from</th><th>State</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <form id="rule-version-form" class="inline-form">
+      <input name="stock_margin" placeholder="stock margin e.g. 0.25" required />
+      <input name="receivable_margin" placeholder="receivable margin e.g. 0.30" required />
+      <input name="debtor_ageing_cutoff_days" placeholder="ageing cutoff days" type="number" required />
+      <input name="submitted_by" placeholder="submitted by (maker)" value="maker.priya" required />
+      <button class="btn btn-small" type="submit">Propose new version</button>
+    </form>
+    <div id="rule-version-result" class="error-banner" hidden></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Covenant waivers &amp; cure tasks</h2>
+    </div>
+    <table class="data-table" id="waivers-table">
+      <thead><tr><th>Waiver</th><th>Test</th><th>Scoped period</th><th>Submitted by</th><th>State</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <table class="data-table" id="cure-tasks-table">
+      <thead><tr><th>Cure task</th><th>Test</th><th>Period</th><th>Opened</th><th>Status</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="waiver-error" class="error-banner" hidden></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Renewal</h2>
+    </div>
+    <div id="renewal-block"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Closure checklist</h2>
+    </div>
+    <div id="closure-block" class="closure-grid"></div>
+    <button class="btn btn-small" id="close-facility-btn">Close facility</button>
+    <div id="closure-error" class="error-banner" hidden></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Maker-checker cases</h2>
+    </div>
+    <table class="data-table" id="cases-table">
+      <thead><tr><th>Case</th><th>Subject</th><th>Submitted by</th><th>State</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="case-error" class="error-banner" hidden></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Audit trail</h2>
+    </div>
+    <table class="data-table" id="audit-table">
+      <thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Detail</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</template>
+
+<script src="app.js"></script>
+</body>
+</html>

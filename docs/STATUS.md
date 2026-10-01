@@ -1,118 +1,38 @@
-# Build status
+# Build status — 1 October 2026
 
-Tracks implemented vs mocked vs deferred, per the build specification's own
-requirement ("Report implemented, mocked, blocked and deferred capabilities
-separately," spec §17) and the user's instruction to distinguish these
-explicitly. This file reflects the state after completing every phase of
-spec §17 that a coding session can actually complete — see "Phases that
-cannot be completed in code" below for why four of the ten phases are not,
-and never will be, checkable off by writing more code.
+This is a synthetic, single-server on-premises evaluation prototype, not the complete application-to-closure product or production bank deployment. The original claim that six phases were complete has been corrected. See REPOSITORY_AUDIT.md for every lifecycle step.
 
-## Implemented (real, tested code)
+## Implemented
 
-**Phase 1 — foundation**
-- Decimal-only `Money` type with unit-mismatch protection.
-- Institution-scoped access control (`CrossInstitutionAccessError`).
-- Append-only audit log on every mutation.
-- Dashboard UI, driven entirely by the real API.
+- Decimal DP arithmetic with finite/nonnegative input, margin, exclusion, currency and unit checks. Missing inputs are indeterminate; negative headroom is preserved.
+- Fail-closed hashed bearer credentials, server-attributed actors, reader/maker/checker roles, tenant access checks and bounded request inputs. Independent approval cannot be bypassed by submitting another actor's name.
+- Reviewed rule versions, historical replay, explicit ambiguous effective-date blocking. Monthly inputs cannot silently resolve a mid-month amendment.
+- Idempotent aggregate imports, retained input revisions, immutable calculation receipts containing exact selected terms/inputs/results.
+- Immutable local synthetic UTF-8 text originals with authorised attachment retrieval and checksum verification; full snapshot/evidence backup bundles.
+- Scoped local waivers and cure tasks, local renewal records, closure blocks for incomplete checklist, missing/nonzero latest balance and non-independent checklist approval.
+- Pure commercial-bank CC daily conduct engine: continuous excess, no credits and credit/interest comparison over complete inclusive 90-day evidence. Incomplete/unattested data and unsupported profiles return indeterminate. No NPA/SMA writes.
+- Atomic versioned/checksummed snapshots, one-writer lease, serialized request commit/rollback and fail-closed persistence failure. Backup/restore tests.
+- On-premises Docker/Compose configuration, exact hashed Python dependency lock, non-root/read-only image settings, persistent volume and deployment/recovery guide. Container execution remains unverified.
 
-**Phase 2 — imports and evidence linking**
-- `POST /v1/imports:financials` — idempotent by content hash (acceptance
-  scenario #1: re-importing identical content creates no duplicate).
-- Malformed figures are rejected before anything is written (acceptance
-  scenario #3).
-- Document versioning: `POST /v1/facilities/{id}/documents` — a replacement
-  never overwrites the original row; both remain queryable, `is_current`
-  is derived, not mutated (acceptance scenario #13).
+## Partial or deferred
 
-**Phase 3 — reviewed rule register**
-- Full rule-version lifecycle: propose (draft) → submit (reviewed) →
-  approve (active), maker-checker enforced, self-approval denied.
-- Approving a new version supersedes the old one without deleting it.
-- Effective-dated selection: a calculation for a historical period still
-  uses the rule version that was in force *then*, even after a newer
-  version has since superseded it for current periods (acceptance
-  scenario #7 — verified live: facility A's 2026-07 calculation keeps
-  using v1 after v2 and v3 were approved for later periods).
+- JSON remains the runtime store: one worker, local disk, no HA/throughput claim. PostgreSQL target DDL is design-only, not a tested runtime migration.
+- Local bearer authentication is not bank SSO/MFA. No branch/portfolio authority matrix or independently protected audit store.
+- Aggregate DP inputs do not implement line-level ageing, creditor/exclusion ordering, sublimits, actual bank DP reconciliation or feed freshness.
+- One synthetic covenant only; no full financial/nonfinancial obligations, legal source/clause extraction, insurance or physical-custody workflow.
+- Two synthetic active facilities; pre-sanction steps are not implemented. Document intake capabilities are described in SECURITY_REVIEW.md; no PDF/OCR/AI review pipeline.
+- The daily conduct module is not connected to a real bank ledger feed. The heuristic shadow score is not a trained/predictively validated model.
+- Checksums are corruption checks, not proof against an administrator rewriting data. Storage/backups require host encryption and separate protected audit controls before real data.
 
-**Phase 4 — DP and evidence monitoring**
-- Deterministic DP engine reproducing the spec §8 worked fixture exactly.
-- "Missing input → indeterminate, never zero" (acceptance scenario #4).
-- Multi-period support with a period selector in the UI.
+## Four external gates
 
-**Phase 5 — covenants, exceptions, renewal, closure**
-- Covenant engine with the spec's full finding-state set.
-- Waivers: maker-checker approved, scoped to exactly one
-  (facility, test, period) triple — a waiver never silently covers a
-  different period's breach of the same test (acceptance scenario #8,
-  verified live: December's breach was not suppressed by November's
-  waiver).
-- Cure tasks: opened automatically on an unwaived breach, idempotent per
-  (facility, test, period) — recomputing twice does not open a duplicate.
-- Renewal decisions (renewed/declined) with actor and timestamp.
-- Closure checklist: a facility cannot close while any item is
-  outstanding — enforced server-side, not just hidden in the UI
-  (acceptance scenario #15, verified live: the close button stayed
-  blocked with 3/4 items checked, then succeeded at 4/4).
+1. **Phase 0 — discovery:** actual BOB/Union account walkthrough, data owners, approved rules, authority and source mapping. Preparation is buildable; validation requires bank staff.
+2. **Phase 6 — approved integration/pilot:** API, scheduled bank export or another approved interface; permissions, operational support and actual reporting-cycle comparison. An API is not mandatory. No endpoint has been invented.
+3. **Phase 7 — assurance:** independent security testing, legal/privacy applicability, bank process/IT/risk/vendor approvals, target-host recovery and support. This change prepares controls; it cannot self-grant external sign-off.
+4. **Phase 9 — optional multi-party ledger:** demonstrated shared-trust problem and participating institutions. Not a prerequisite for a single-bank prototype; compare a central signed registry first.
 
-**Persistence**
-- State now survives a process restart (JSON snapshot, verified by
-  restarting the real dev server mid-session and confirming an approval
-  was still there). Still not Postgres — see docs/ASSUMPTIONS.md.
+Do not claim all scenarios or all ambiguities are covered. Tests and remaining limits are recorded in the pull request and review documentation.
 
-**Phase 8 — predictive ML, scoped down to what's honest**
-- A feature-snapshot shape and one transparent, hand-written heuristic
-  (`calculations/shadow_score.py`) — explicitly NOT a trained model, every
-  API response carries the disclaimer. This is the full extent of what
-  spec §9 permits without real labelled outcome data, which does not
-  exist for a synthetic pilot (spec §9: "No synthetic pilot proves
-  predictive credit accuracy").
+## Verification evidence
 
-**Tests:** 55 passed, 0 failed (`uv run pytest -q`), covering every
-acceptance scenario above at the HTTP layer, not just unit-level.
-
-## Mocked / stubbed (present but not real)
-
-- Persistence: JSON file, not a relational database — no migrations, no
-  concurrent-writer safety, no indexes.
-- Auth: a static "Viewing as: RM" label; the API's maker-checker check is
-  real, but the UI does not yet hide either role's action based on a real
-  logged-in identity.
-- Shadow score: heuristic, not a trained model (see Phase 8 above).
-- Document registration: hashes and versions a reference; does not store,
-  OCR, or parse actual files.
-
-## Phases that cannot be completed in code
-
-Spec §17 defines ten phases. Six are done (above). Four are not attempted,
-and building more code cannot complete them — they require things that
-only exist outside this session:
-
-- **Phase 0 (bank discovery):** requires an actual walkthrough of a real
-  sanctioned CC account with BOB/Union staff. Nothing here can substitute
-  for that without inventing bank process details, which the spec's
-  mandatory constraints explicitly forbid.
-- **Phase 6 (bank-approved interfaces, shadow pilot):** requires a bank to
-  hand over a documented, approved integration interface (mandatory
-  constraint #8: "No invented bank APIs"). `adapters/bob` and
-  `adapters/union` remain empty, flagged stubs — this is correct, not
-  incomplete.
-- **Phase 7 (production assurance):** requires independent security
-  testing, legal/compliance sign-off, and a real support/DR posture — none
-  of which a coding session can grant itself.
-- **Phase 9 (multi-party evidence network / blockchain):** requires
-  multiple real participating institutions and a demonstrated shared-trust
-  problem (spec §10: "Do not put blockchain in the MVP"). Not started, on
-  purpose.
-
-## Known limitations of this slice
-
-- The UI's role label does not gate actions — the *server* correctly
-  rejects a self-approval, but nothing yet hides the option client-side.
-- One covenant test is wired up, not the full obligation register spec
-  §18 describes.
-- No real document storage/OCR — only reference registration and
-  versioning.
-- Single synthetic institution, two facilities — spec §17's fuller
-  corpus (`SIM-002..009`) is explicitly out of scope, same pacing the spec
-  itself recommends.
+132 tests passed in the final shared-tree run, including an actual Uvicorn socket/process restart that retained an import and calculation receipt. JavaScript syntax and git whitespace checks passed. Docker/container and PostgreSQL execution were not performed. One upstream Starlette/httpx deprecation warning remains. Tests do not establish independent penetration-test or regulatory sign-off.

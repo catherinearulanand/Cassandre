@@ -5,7 +5,7 @@ outstanding, enforced server-side."""
 
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
+from auth_client import TestClient
 
 from cassandre_cc.api.main import app
 
@@ -54,6 +54,9 @@ def test_closing_facility_succeeds_once_every_item_is_true():
     assert final.status_code == 200
     assert final.json()["closure_ready"] is True
 
-    closed = client.post("/v1/facilities/SIM-FAC-A001:close", json={"actor": "ops.rahul"})
+    blocked = client.post("/v1/facilities/SIM-FAC-A001:close", json={"actor": "checker.arvind"})
+    assert blocked.status_code == 409  # checklist cannot override nonzero balance
+    assert client.post("/v1/imports:financials", json={"facility_id":"SIM-FAC-A001", "period":"2027-01", "outstanding_crore":"0"}).status_code == 200
+    closed = client.post("/v1/facilities/SIM-FAC-A001:close", json={"actor": "checker.arvind"})
     assert closed.status_code == 200
     assert closed.json()["state"] == "closed"

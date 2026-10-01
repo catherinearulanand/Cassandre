@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from fastapi.testclient import TestClient
+from auth_client import TestClient
 
 from cassandre_cc.api.main import app
 

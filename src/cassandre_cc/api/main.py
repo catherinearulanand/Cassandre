@@ -23,11 +23,16 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
+from cassandre_cc.evidence.storage import EvidenceStore, EvidenceIntegrityError
+from pydantic import BaseModel, Field, field_validator, ConfigDict
+from cassandre_cc.api.security import actor as authenticated_actor, visible, require_facility, install_security, current_principal
 
 from cassandre_cc.calculations.covenant import Comparator, CovenantTest, evaluate_covenant_with_waiver
 from cassandre_cc.calculations.drawing_power import calculate_drawing_power, inputs_from_records
 from cassandre_cc.calculations.shadow_score import compute_shadow_score
+from cassandre_cc.calculations.replay import preserve_run
 from cassandre_cc.domain.entities import (
     ClosureChecklist,
     DocumentRef,
@@ -39,6 +44,7 @@ from cassandre_cc.domain.entities import (
 from cassandre_cc.domain.states import DPResultState, FacilityState, FindingState, ObligationState
 from cassandre_cc.fixtures.synthetic_seed import INSTITUTION_ID, seed
 from cassandre_cc.store import persistence
+from cassandre_cc.store.transactions import SnapshotTransactions, WriterLease
 from cassandre_cc.store.memory_store import CrossInstitutionAccessError, MemoryStore, new_id
 from cassandre_cc.workflow.maker_checker import (
     InvalidTransitionError,
@@ -52,7 +58,7 @@ from cassandre_cc.workflow.maker_checker import (
     supersede_rule_version,
 )
 
-app = FastAPI(title="Cassandre CC", version="0.2.0")
+app = FastAPI(title="Cassandre CC", version="0.2.0", docs_url=None, redoc_url=None, openapi_url=None)
 
 _DEFAULT_SNAPSHOT_PATH = Path(__file__).resolve().parents[3] / "data" / "store_snapshot.json"
 # Overridable so the test suite runs against an isolated, always-fresh
@@ -60,12 +66,25 @@ _DEFAULT_SNAPSHOT_PATH = Path(__file__).resolve().parents[3] / "data" / "store_s
 # tests/conftest.py) — without this, a second `pytest` run would load the
 # first run's mutated state instead of the synthetic seed.
 _SNAPSHOT_PATH = Path(os.environ.get("CASSANDRE_CC_STORE_PATH", str(_DEFAULT_SNAPSHOT_PATH)))
+_writer_lease = WriterLease(_SNAPSHOT_PATH)
 _store = persistence.load(_SNAPSHOT_PATH) or seed(MemoryStore())
+_evidence_store = EvidenceStore(_SNAPSHOT_PATH.parent / "evidence")
 
+
+app.add_middleware(SnapshotTransactions, store_getter=lambda: _store, path=_SNAPSHOT_PATH)
+install_security(app, lambda: _store)
+
+@app.exception_handler(RequestValidationError)
+async def safe_validation_error(request, exc):
+    return JSONResponse(status_code=422, content={"detail": [{"loc": list(e["loc"]), "type": e["type"], "msg": "Invalid input"} for e in exc.errors()]})
 
 def _persist() -> None:
     persistence.save(_store, _SNAPSHOT_PATH)
 
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "mode": "synthetic"}
 
 # Provisional covenant test — see calculations/covenant.py module docstring:
 # this threshold is a placeholder, not an approved bank definition.
@@ -100,6 +119,10 @@ def _facility_summary(facility_id: str) -> dict[str, Any]:
 
 
 def _calculation_for(facility_id: str, period: Optional[str] = None) -> dict[str, Any]:
+    if period is not None:
+        import re
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", period):
+            raise HTTPException(422, "Reporting period must be YYYY-MM")
     facility = _store.facilities[facility_id]
     period = period or _store.latest_period_for_facility(facility_id)
     financials = _store.get_financials(facility_id, period) if period else None
@@ -156,15 +179,24 @@ def _calculation_for(facility_id: str, period: Optional[str] = None) -> dict[str
 # =========================================================================
 
 
+@app.get("/v1/session")
+def authenticated_session():
+    p = current_principal.get()
+    return {"actor":p.actor, "institution_id":p.institution_id, "roles":sorted(p.roles)}
+
+@app.get("/v1/facilities/{facility_id}/calculation-runs")
+def calculation_runs(facility_id: str):
+    return [asdict(run) for run in _store.calculation_runs.values() if run.facility_id == facility_id]
+
 @app.get("/v1/facilities")
 def list_facilities() -> list[dict[str, Any]]:
-    return [_facility_summary(fid) for fid in _store.facilities]
+    return [_facility_summary(fid) for fid in _store.facilities if visible(_store, fid)]
 
 
 @app.get("/v1/facilities/{facility_id}")
 def get_facility(facility_id: str, period: Optional[str] = None) -> dict[str, Any]:
     try:
-        _store.get_facility(facility_id, INSTITUTION_ID)
+        _store.get_facility(facility_id, current_principal.get().institution_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="no facility for this id")
     except CrossInstitutionAccessError as exc:
@@ -209,7 +241,7 @@ def recompute_calculation(facility_id: str, period: Optional[str] = None) -> dic
     (non-waived) breach, opens a cure task — idempotent per (facility,
     test, period)."""
     try:
-        _store.get_facility(facility_id, INSTITUTION_ID)
+        _store.get_facility(facility_id, current_principal.get().institution_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="no facility for this id")
 
@@ -218,15 +250,16 @@ def recompute_calculation(facility_id: str, period: Optional[str] = None) -> dic
     if calc["covenant_finding"] in (FindingState.POTENTIAL_BREACH.value, FindingState.CONFIRMED_BREACH.value):
         _store.open_cure_task(facility_id, _HEADROOM_COVENANT.test_id, resolved_period)
 
+    run = preserve_run(_store, facility_id, calc, authenticated_actor())
     _store.record_event(
-        institution_id=INSTITUTION_ID,
-        actor="system.calc_engine",
+        institution_id=current_principal.get().institution_id,
+        actor=authenticated_actor(),
         action="DP_CALCULATION_RUN",
-        detail=f"period={resolved_period} result={calc['result_state']} finding={calc['covenant_finding']}",
+        detail=f"run={run.run_id} period={resolved_period} result={calc['result_state']} finding={calc['covenant_finding']}",
         facility_id=facility_id,
     )
     _persist()
-    return calc
+    return {**calc, "run_id": run.run_id}
 
 
 # =========================================================================
@@ -234,7 +267,19 @@ def recompute_calculation(facility_id: str, period: Optional[str] = None) -> dic
 # =========================================================================
 
 
-class FinancialsImport(BaseModel):
+class BoundaryModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_max_length=4096)
+
+    @field_validator("period", "evidence_period", "scoped_period", "expires_after_period", check_fields=False)
+    @classmethod
+    def valid_period(cls, value):
+        if value is not None:
+            import re
+            if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", value):
+                raise ValueError("Reporting period must be YYYY-MM")
+        return value
+
+class FinancialsImport(BoundaryModel):
     facility_id: str
     period: str
     reported_stock_crore: Optional[str] = None
@@ -259,18 +304,21 @@ def _validate_decimal_fields(payload: FinancialsImport) -> None:
         if value is None:
             continue
         try:
-            Decimal(value)
+            number = Decimal(value)
+            if not number.is_finite() or number < 0 or number > Decimal("1000000000") or len(value) > 64:
+                raise InvalidOperation
         except InvalidOperation:
             raise HTTPException(
                 status_code=422,
-                detail={"failure": "INVALID_DECIMAL_VALUE", "field": field_name, "value": value},
+                detail={"failure": "INVALID_DECIMAL_VALUE", "field": field_name},
             )
 
 
 @app.post("/v1/imports:financials")
 def import_financials(payload: FinancialsImport) -> dict[str, Any]:
+    require_facility(_store, payload.facility_id)
     try:
-        _store.get_facility(payload.facility_id, INSTITUTION_ID)
+        _store.get_facility(payload.facility_id, current_principal.get().institution_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="no facility for this id")
 
@@ -280,7 +328,7 @@ def import_financials(payload: FinancialsImport) -> dict[str, Any]:
         json.dumps(payload.model_dump(), sort_keys=True).encode("utf-8")
     ).hexdigest()
     batch, was_new = _store.record_import(
-        institution_id=INSTITUTION_ID,
+        institution_id=current_principal.get().institution_id,
         facility_id=payload.facility_id,
         period=payload.period,
         content_hash=content_hash,
@@ -288,6 +336,9 @@ def import_financials(payload: FinancialsImport) -> dict[str, Any]:
     )
 
     if was_new:
+        prior = _store.get_financials(payload.facility_id, payload.period)
+        if prior is not None:
+            _store.financials_history.setdefault(f"seed:{payload.facility_id}:{payload.period}", prior)
         _store.set_financials(
             FacilityFinancials(
                 facility_id=payload.facility_id,
@@ -299,9 +350,10 @@ def import_financials(payload: FinancialsImport) -> dict[str, Any]:
                 outstanding_crore=payload.outstanding_crore,
             )
         )
+        _store.financials_history[batch.batch_id] = _store.get_financials(payload.facility_id, payload.period)
         _store.record_event(
-            institution_id=INSTITUTION_ID,
-            actor="system.import",
+            institution_id=current_principal.get().institution_id,
+            actor=authenticated_actor(),
             action="FINANCIALS_IMPORTED",
             detail=f"batch={batch.batch_id} period={payload.period}",
             facility_id=payload.facility_id,
@@ -318,52 +370,61 @@ def import_financials(payload: FinancialsImport) -> dict[str, Any]:
 
 @app.get("/v1/imports")
 def list_imports() -> list[dict[str, Any]]:
-    return [{**asdict(b), "imported_at": b.imported_at.isoformat()} for b in _store.import_batches.values()]
+    return [{**asdict(b), "imported_at": b.imported_at.isoformat()} for b in _store.import_batches.values() if visible(_store, b.facility_id)]
 
 
 # =========================================================================
 # Document versioning (spec §6 / acceptance scenario #13)
 # =========================================================================
-# This registers a document REFERENCE and its content hash — not real file
-# storage, OCR, or clause extraction, all of which spec §9 scopes as
-# separate, later work. What it does guarantee: a replacement never
+# This registers bounded synthetic plain text and its content hash.
+# PDFs, malware inspection, OCR and clause extraction remain later work.
+# A replacement never
 # overwrites the original row, so a past calculation that cited the
 # original document stays reproducible (spec §11.6: "reviewer-confirmed
 # replacements... previous result reproducible").
 
 
-class DocumentRegister(BaseModel):
+class DocumentRegister(BoundaryModel):
     document_type: str
     evidence_period: str
-    content: str  # stands in for uploaded bytes; hashed, never stored raw
+    content: str = Field(max_length=200000)  # bounded synthetic plain text; preserved exactly
     supersedes_document_id: Optional[str] = None
 
 
 @app.post("/v1/facilities/{facility_id}/documents")
 def register_document(facility_id: str, body: DocumentRegister) -> dict[str, Any]:
     try:
-        _store.get_facility(facility_id, INSTITUTION_ID)
+        _store.get_facility(facility_id, current_principal.get().institution_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="no facility for this id")
 
     if body.supersedes_document_id is not None and body.supersedes_document_id not in _store.documents:
         raise HTTPException(status_code=404, detail="supersedes_document_id does not exist")
 
+    if body.supersedes_document_id and _store.documents[body.supersedes_document_id].facility_id != facility_id:
+        raise HTTPException(422, "Replacement must belong to the same facility")
+
+    try:
+        content_digest = _evidence_store.put_text(body.content)
+    except ValueError:
+        raise HTTPException(422, "Invalid synthetic plain-text evidence")
+    except OSError:
+        raise HTTPException(503, "Evidence storage unavailable")
     doc = DocumentRef(
         document_id=new_id("DOC"),
-        institution_id=INSTITUTION_ID,
+        institution_id=current_principal.get().institution_id,
         facility_id=facility_id,
         document_type=body.document_type,
         evidence_period=body.evidence_period,
         received_at=datetime.now(timezone.utc),
-        source_hash=hashlib.sha256(body.content.encode("utf-8")).hexdigest(),
+        source_hash=content_digest,
         supersedes_document_id=body.supersedes_document_id,
         is_original=body.supersedes_document_id is None,
     )
     _store.documents[doc.document_id] = doc
     _store.record_event(
-        institution_id=INSTITUTION_ID,
-        actor="system.import",
+        institution_id=current_principal.get().institution_id,
+        actor=authenticated_actor(),
         action="DOCUMENT_REGISTERED",
         detail=f"document={doc.document_id} type={doc.document_type}"
         + (f" supersedes={doc.supersedes_document_id}" if doc.supersedes_document_id else ""),
@@ -372,6 +433,21 @@ def register_document(facility_id: str, body: DocumentRegister) -> dict[str, Any
     _persist()
     return {**asdict(doc), "received_at": doc.received_at.isoformat()}
 
+
+@app.get("/v1/facilities/{facility_id}/documents/{document_id}/content")
+def original_document(facility_id: str, document_id: str):
+    doc = _store.documents.get(document_id)
+    if doc is None or doc.facility_id != facility_id or doc.institution_id != current_principal.get().institution_id:
+        raise HTTPException(404, "No accessible document")
+    try:
+        content = _evidence_store.get_bytes(doc.source_hash)
+    except FileNotFoundError:
+        raise HTTPException(409, "Original evidence missing; verification required")
+    except EvidenceIntegrityError:
+        raise HTTPException(409, "Evidence integrity verification failed")
+    except OSError:
+        raise HTTPException(503, "Evidence storage unavailable")
+    return Response(content, media_type="application/octet-stream", headers={"Content-Disposition": "attachment; filename=synthetic-evidence.txt"})
 
 @app.get("/v1/facilities/{facility_id}/documents")
 def list_documents(facility_id: str) -> list[dict[str, Any]]:
@@ -393,20 +469,29 @@ def list_documents(facility_id: str) -> list[dict[str, Any]]:
 # =========================================================================
 
 
-class RuleVersionPropose(BaseModel):
+class RuleVersionPropose(BoundaryModel):
     stock_margin: str
     receivable_margin: str
     debtor_ageing_cutoff_days: int
-    submitted_by: str
+    submitted_by: str = ""
 
 
 @app.post("/v1/facilities/{facility_id}/rule-versions")
 def propose_rule_version(facility_id: str, body: RuleVersionPropose) -> dict[str, Any]:
     try:
-        _store.get_facility(facility_id, INSTITUTION_ID)
+        _store.get_facility(facility_id, current_principal.get().institution_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="no facility for this id")
 
+    for margin in (body.stock_margin, body.receivable_margin):
+        try:
+            number = Decimal(margin)
+            if not number.is_finite() or not 0 <= number <= 1:
+                raise InvalidOperation
+        except InvalidOperation:
+            raise HTTPException(422, "Margins must be finite fractions between zero and one")
+    if not 0 <= body.debtor_ageing_cutoff_days <= 3650:
+        raise HTTPException(422, "Invalid ageing cutoff")
     existing = _store.rule_versions_for_facility(facility_id)
     next_version = (max((r.version for r in existing), default=0)) + 1
 
@@ -418,13 +503,13 @@ def propose_rule_version(facility_id: str, body: RuleVersionPropose) -> dict[str
         stock_margin=body.stock_margin,
         receivable_margin=body.receivable_margin,
         debtor_ageing_cutoff_days=body.debtor_ageing_cutoff_days,
-        submitted_by=body.submitted_by,
+        submitted_by=authenticated_actor(),
     )
     rule = submit_rule_version(rule)
     _store.rule_sets[rule.rule_set_id] = rule
     _store.record_event(
-        institution_id=INSTITUTION_ID,
-        actor=body.submitted_by,
+        institution_id=current_principal.get().institution_id,
+        actor=authenticated_actor(),
         action="RULE_VERSION_PROPOSED",
         detail=f"rule_set={rule.rule_set_id} v{rule.version}",
         facility_id=facility_id,
@@ -433,8 +518,8 @@ def propose_rule_version(facility_id: str, body: RuleVersionPropose) -> dict[str
     return {**asdict(rule), "state": rule.state.value}
 
 
-class RuleVersionApprove(BaseModel):
-    approver: str
+class RuleVersionApprove(BoundaryModel):
+    approver: str = ""
     effective_from: date
 
 
@@ -445,7 +530,7 @@ def approve_rule_version_endpoint(rule_set_id: str, body: RuleVersionApprove) ->
         raise HTTPException(status_code=404, detail="no rule version for this id")
 
     try:
-        approved = approve_rule_version(rule, body.approver, body.effective_from)
+        approved = approve_rule_version(rule, authenticated_actor(), body.effective_from)
     except SelfApprovalError as exc:
         raise HTTPException(status_code=409, detail={"failure": "SELF_APPROVAL_DENIED", "message": str(exc)})
     except InvalidTransitionError as exc:
@@ -460,8 +545,8 @@ def approve_rule_version_endpoint(rule_set_id: str, body: RuleVersionApprove) ->
 
     _store.rule_sets[rule_set_id] = approved
     _store.record_event(
-        institution_id=INSTITUTION_ID,
-        actor=body.approver,
+        institution_id=current_principal.get().institution_id,
+        actor=authenticated_actor(),
         action="RULE_VERSION_APPROVED",
         detail=f"rule_set={rule_set_id} effective_from={body.effective_from.isoformat()}",
         facility_id=rule.facility_id,
@@ -475,19 +560,20 @@ def approve_rule_version_endpoint(rule_set_id: str, body: RuleVersionApprove) ->
 # =========================================================================
 
 
-class WaiverPropose(BaseModel):
+class WaiverPropose(BoundaryModel):
     facility_id: str
     test_id: str
     scoped_period: str
     reason: str
-    submitted_by: str
+    submitted_by: str = ""
     expires_after_period: Optional[str] = None
 
 
 @app.post("/v1/waivers")
 def propose_waiver(body: WaiverPropose) -> dict[str, Any]:
+    require_facility(_store, body.facility_id)
     try:
-        _store.get_facility(body.facility_id, INSTITUTION_ID)
+        _store.get_facility(body.facility_id, current_principal.get().institution_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="no facility for this id")
 
@@ -497,14 +583,14 @@ def propose_waiver(body: WaiverPropose) -> dict[str, Any]:
         test_id=body.test_id,
         scoped_period=body.scoped_period,
         reason=body.reason,
-        submitted_by=body.submitted_by,
+        submitted_by=authenticated_actor(),
         expires_after_period=body.expires_after_period,
     )
     waiver = submit_waiver(waiver)
     _store.waivers[waiver.waiver_id] = waiver
     _store.record_event(
-        institution_id=INSTITUTION_ID,
-        actor=body.submitted_by,
+        institution_id=current_principal.get().institution_id,
+        actor=authenticated_actor(),
         action="WAIVER_PROPOSED",
         detail=f"waiver={waiver.waiver_id} test={body.test_id} period={body.scoped_period}",
         facility_id=body.facility_id,
@@ -513,8 +599,8 @@ def propose_waiver(body: WaiverPropose) -> dict[str, Any]:
     return {**asdict(waiver), "state": waiver.state.value}
 
 
-class WaiverApprove(BaseModel):
-    approver: str
+class WaiverApprove(BoundaryModel):
+    approver: str = ""
 
 
 @app.post("/v1/waivers/{waiver_id}:approve")
@@ -524,7 +610,7 @@ def approve_waiver_endpoint(waiver_id: str, body: WaiverApprove) -> dict[str, An
         raise HTTPException(status_code=404, detail="no waiver for this id")
 
     try:
-        approved = approve_waiver(waiver, body.approver)
+        approved = approve_waiver(waiver, authenticated_actor())
     except SelfApprovalError as exc:
         raise HTTPException(status_code=409, detail={"failure": "SELF_APPROVAL_DENIED", "message": str(exc)})
     except InvalidTransitionError as exc:
@@ -532,8 +618,8 @@ def approve_waiver_endpoint(waiver_id: str, body: WaiverApprove) -> dict[str, An
 
     _store.waivers[waiver_id] = approved
     _store.record_event(
-        institution_id=INSTITUTION_ID,
-        actor=body.approver,
+        institution_id=current_principal.get().institution_id,
+        actor=authenticated_actor(),
         action="WAIVER_APPROVED",
         detail=f"waiver={waiver_id}",
         facility_id=waiver.facility_id,
@@ -544,7 +630,7 @@ def approve_waiver_endpoint(waiver_id: str, body: WaiverApprove) -> dict[str, An
 
 @app.get("/v1/waivers")
 def list_waivers(facility_id: Optional[str] = None) -> list[dict[str, Any]]:
-    waivers = _store.waivers.values()
+    waivers = [w for w in _store.waivers.values() if visible(_store, w.facility_id)]
     if facility_id:
         waivers = [w for w in waivers if w.facility_id == facility_id]
     return [{**asdict(w), "state": w.state.value} for w in waivers]
@@ -555,9 +641,9 @@ def list_waivers(facility_id: Optional[str] = None) -> list[dict[str, Any]]:
 # =========================================================================
 
 
-class RenewalDecide(BaseModel):
+class RenewalDecide(BoundaryModel):
     decision: str  # "renewed" | "declined"
-    decided_by: str
+    decided_by: str = ""
     notes: str = ""
 
 
@@ -569,17 +655,19 @@ def decide_renewal(renewal_id: str, body: RenewalDecide) -> dict[str, Any]:
     if body.decision not in ("renewed", "declined"):
         raise HTTPException(status_code=422, detail={"failure": "INVALID_DECISION", "value": body.decision})
 
+    if renewal.decision != "pending":
+        raise HTTPException(409, "Renewal decision already recorded")
     updated = replace(
         renewal,
         decision=body.decision,
-        decided_by=body.decided_by,
+        decided_by=authenticated_actor(),
         decided_at=datetime.now(timezone.utc),
         notes=body.notes,
     )
     _store.renewals[renewal_id] = updated
     _store.record_event(
-        institution_id=INSTITUTION_ID,
-        actor=body.decided_by,
+        institution_id=current_principal.get().institution_id,
+        actor=authenticated_actor(),
         action="RENEWAL_DECIDED",
         detail=f"renewal={renewal_id} decision={body.decision}",
         facility_id=renewal.facility_id,
@@ -592,11 +680,11 @@ def decide_renewal(renewal_id: str, body: RenewalDecide) -> dict[str, Any]:
 def list_renewals() -> list[dict[str, Any]]:
     return [
         {**asdict(r), "decided_at": r.decided_at.isoformat() if r.decided_at else None}
-        for r in _store.renewals.values()
+        for r in _store.renewals.values() if visible(_store, r.facility_id)
     ]
 
 
-class ClosureUpdate(BaseModel):
+class ClosureUpdate(BoundaryModel):
     dues_reconciled: Optional[bool] = None
     security_released: Optional[bool] = None
     linked_exposures_clear: Optional[bool] = None
@@ -618,8 +706,8 @@ def update_closure_checklist(facility_id: str, body: ClosureUpdate) -> dict[str,
     updated = replace(checklist, **updates)
     _store.closures[facility_id] = updated
     _store.record_event(
-        institution_id=INSTITUTION_ID,
-        actor=body.actor,
+        institution_id=current_principal.get().institution_id,
+        actor=authenticated_actor(),
         action="CLOSURE_CHECKLIST_UPDATED",
         detail=f"{updates}",
         facility_id=facility_id,
@@ -631,8 +719,8 @@ def update_closure_checklist(facility_id: str, body: ClosureUpdate) -> dict[str,
     return {**asdict(updated), "closure_ready": ready}
 
 
-class CloseFacility(BaseModel):
-    actor: str
+class CloseFacility(BoundaryModel):
+    actor: str = ""
 
 
 @app.post("/v1/facilities/{facility_id}:close")
@@ -656,10 +744,17 @@ def close_facility(facility_id: str, body: CloseFacility) -> dict[str, Any]:
             },
         )
 
+    period = _store.latest_period_for_facility(facility_id)
+    financials = _store.get_financials(facility_id, period) if period else None
+    if financials is None or financials.outstanding_crore is None or Decimal(financials.outstanding_crore) != 0:
+        raise HTTPException(409, {"failure": "OUTSTANDING_NOT_ZERO", "message": "Latest recorded outstanding must be present and zero; synthetic data only"})
+    checklist_events = [e for e in _store.audit_events if e.facility_id == facility_id and e.action == "CLOSURE_CHECKLIST_UPDATED"]
+    if any(e.actor == authenticated_actor() for e in checklist_events):
+        raise HTTPException(409, {"failure":"SELF_APPROVAL_DENIED", "message":"Closure checker must differ from checklist maker"})
     _store.facilities[facility_id] = replace(facility, state=FacilityState.CLOSED)
     _store.record_event(
-        institution_id=INSTITUTION_ID,
-        actor=body.actor,
+        institution_id=current_principal.get().institution_id,
+        actor=authenticated_actor(),
         action="FACILITY_CLOSED",
         detail="all closure checklist items complete",
         facility_id=facility_id,
@@ -675,11 +770,12 @@ def close_facility(facility_id: str, body: CloseFacility) -> dict[str, Any]:
 
 @app.get("/v1/cases")
 def list_cases() -> list[dict[str, Any]]:
-    return [{**asdict(c), "state": c.state.value} for c in _store.approval_cases.values()]
+    return [{**asdict(c), "state": c.state.value} for c in _store.approval_cases.values()
+            if visible(_store, getattr(_store.rule_sets.get(c.subject_id) or _store.waivers.get(c.subject_id), "facility_id", None))]
 
 
-class ApproveRequest(BaseModel):
-    approver: str
+class ApproveRequest(BoundaryModel):
+    approver: str = ""
 
 
 @app.post("/v1/cases/{case_id}:approve")
@@ -689,7 +785,7 @@ def approve_case_endpoint(case_id: str, body: ApproveRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="no case for this id")
 
     try:
-        updated = approve_case(case, body.approver)
+        updated = approve_case(case, authenticated_actor())
     except SelfApprovalError as exc:
         raise HTTPException(status_code=409, detail={"failure": "SELF_APPROVAL_DENIED", "message": str(exc)})
     except InvalidTransitionError as exc:
@@ -697,8 +793,8 @@ def approve_case_endpoint(case_id: str, body: ApproveRequest) -> dict[str, Any]:
 
     _store.approval_cases[case_id] = updated
     _store.record_event(
-        institution_id=INSTITUTION_ID,
-        actor=body.approver,
+        institution_id=current_principal.get().institution_id,
+        actor=authenticated_actor(),
         action="CASE_APPROVED",
         detail=f"case={case_id} subject={case.subject_id}",
     )
@@ -708,7 +804,7 @@ def approve_case_endpoint(case_id: str, body: ApproveRequest) -> dict[str, Any]:
 
 @app.get("/v1/audit-events")
 def list_audit_events(facility_id: Optional[str] = None) -> list[dict[str, Any]]:
-    events = _store.audit_events
+    events = [e for e in _store.audit_events if e.institution_id == current_principal.get().institution_id]
     if facility_id:
         events = [e for e in events if e.facility_id == facility_id]
     return [
@@ -722,7 +818,7 @@ def get_shadow_score(facility_id: str, period: Optional[str] = None) -> dict[str
     """Phase 8 scaffold. See calculations/shadow_score.py — not a trained
     model, never used to gate anything, returned only with its disclaimer."""
     try:
-        _store.get_facility(facility_id, INSTITUTION_ID)
+        _store.get_facility(facility_id, current_principal.get().institution_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="no facility for this id")
 

@@ -8,8 +8,34 @@
   const appMain = document.getElementById("app-main");
   const tpl = document.getElementById("tpl-facility-detail");
 
+  let accessToken = "";
+  const sessionBar = document.createElement("div");
+  const sessionLabel = document.createElement("span");
+  const switchUser = document.createElement("button");
+  sessionLabel.textContent = "Authentication required";
+  switchUser.textContent = "Sign in / switch user";
+  sessionBar.append(sessionLabel, switchUser);
+  document.body.prepend(sessionBar);
+  switchUser.addEventListener("click", () => {
+    accessToken = ""; activeFacilityId = null; activePeriod = null;
+    facilityList.replaceChildren(); appMain.replaceChildren(); loadFacilities().catch(console.error);
+  });
+  async function signIn() {
+    return new Promise(resolve => {
+      const dialog = document.createElement("dialog");
+      const form = document.createElement("form"); form.method = "dialog";
+      const label = document.createElement("label"); label.textContent = "Administrator-issued token (kept only in page memory)";
+      const input = document.createElement("input"); input.type = "password"; input.autocomplete = "off"; input.required = true;
+      const submit = document.createElement("button"); submit.type = "submit"; submit.textContent = "Sign in";
+      form.append(label, input, submit); dialog.append(form); document.body.append(dialog);
+      dialog.addEventListener("close", () => { const token = input.value; input.value = ""; dialog.remove(); resolve(token); });
+      dialog.showModal(); input.focus();
+    });
+  }
   let activeFacilityId = null;
   let activePeriod = null;
+
+  function escapeHTML(value) { return String(value == null ? "" : value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;", "'":"&#39;"}[c])); }
 
   const CHIP_CLASS = {
     compliant: "chip--ok",
@@ -38,10 +64,12 @@
   function chip(value, kind) {
     const cls = CHIP_CLASS[value] || "chip--unknown";
     const label = (value || "—").replace(/_/g, " ");
-    return `<span class="${kind}-chip ${cls}">${label}</span>`;
+    return `<span class="${escapeHTML(kind)}-chip ${escapeHTML(cls)}">${escapeHTML(label)}</span>`;
   }
 
   async function api(path, options) {
+    options = options || {};
+    options.headers = {...(options.headers || {}), Authorization: `Bearer ${accessToken}`};
     const resp = await fetch(path, options);
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok) {
@@ -63,12 +91,18 @@
   }
 
   async function loadFacilities() {
+    if (!accessToken) {
+      accessToken = await signIn();
+      if (!accessToken) return;
+      const session = await api("/v1/session");
+      sessionLabel.textContent = `${session.actor} · ${session.roles.join(", ")}`;
+    }
     const facilities = await api("/v1/facilities");
     facilityList.innerHTML = "";
     facilities.forEach((f) => {
       const btn = document.createElement("button");
       btn.className = "facility-card" + (f.facility_id === activeFacilityId ? " active" : "");
-      btn.innerHTML = `<span class="fc-name">${f.borrower_name}</span><span class="fc-ref">${f.external_facility_ref} · ${f.state}</span>`;
+      btn.innerHTML = `<span class="fc-name">${escapeHTML(f.borrower_name)}</span><span class="fc-ref">${escapeHTML(f.external_facility_ref)} · ${escapeHTML(f.state)}</span>`;
       btn.addEventListener("click", () => selectFacility(f.facility_id));
       facilityList.appendChild(btn);
     });
@@ -79,7 +113,7 @@
 
   function formatMoney(m) {
     if (!m) return "—";
-    return `₹${m.amount} ${m.unit}`;
+    return `₹${escapeHTML(m.amount)} ${escapeHTML(m.unit)}`;
   }
 
   async function selectFacility(facilityId) {
@@ -103,7 +137,7 @@
     appMain.querySelector('[data-field="facility_state"]').textContent = detail.state.toUpperCase();
 
     const periodSelect = appMain.querySelector("#period-select");
-    periodSelect.innerHTML = detail.periods.map((p) => `<option value="${p}">${p}</option>`).join("");
+    periodSelect.innerHTML = detail.periods.map((p) => `<option value="${escapeHTML(p)}">${escapeHTML(p)}</option>`).join("");
     periodSelect.value = activePeriod;
     periodSelect.addEventListener("change", async () => {
       activePeriod = periodSelect.value;
@@ -199,12 +233,12 @@
       ["Proposed DP", formatMoney(calc.proposed_dp)],
       ["Usable cap", formatMoney(calc.usable_cap)],
       ["Indicative headroom", formatMoney(calc.headroom)],
-      ["Rule-set version", calc.rule_set_version != null ? `v${calc.rule_set_version} (${calc.rule_set_state})` : "—"],
+      ["Rule-set version", calc.rule_set_version != null ? `v${escapeHTML(calc.rule_set_version)} (${escapeHTML(calc.rule_set_state)})` : "—"],
       ["Covenant finding", calc.covenant_finding ? chip(calc.covenant_finding, "finding") + (calc.waiver_applied ? " <em>waived</em>" : "") : "—"],
     ];
     entries.forEach(([label, value]) => {
       const row = document.createElement("div");
-      row.innerHTML = `<dt>${label}</dt><dd>${value}</dd>`;
+      row.innerHTML = `<dt>${escapeHTML(label)}</dt><dd>${value}</dd>`;
       rows.appendChild(row);
     });
   }
@@ -214,7 +248,7 @@
     tbody.innerHTML = "";
     evidence.forEach((e) => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${e.field_name.replace(/_/g, " ")}</td><td>${e.period}</td><td>${chip(e.state, "evidence")}</td><td>${e.reviewer || "—"}</td>`;
+      tr.innerHTML = `<td>${escapeHTML(e.field_name.replace(/_/g, " "))}</td><td>${escapeHTML(e.period)}</td><td>${chip(e.state, "evidence")}</td><td>${escapeHTML(e.reviewer || "—")}</td>`;
       tbody.appendChild(tr);
     });
   }
@@ -225,11 +259,11 @@
     versions.forEach((r) => {
       const tr = document.createElement("tr");
       tr.innerHTML = `
-        <td>v${r.version}</td>
+        <td>v${escapeHTML(r.version)}</td>
         <td>${(parseFloat(r.stock_margin) * 100).toFixed(0)}% / ${(parseFloat(r.receivable_margin) * 100).toFixed(0)}%</td>
-        <td>${r.debtor_ageing_cutoff_days}d</td>
-        <td>${r.effective_from || "—"}</td>
-        <td>${chip(r.state, "rule")} ${r.state === "reviewed" ? `<button class="btn btn-small" data-approve-rule="${r.rule_set_id}">Approve</button>` : ""}</td>
+        <td>${escapeHTML(r.debtor_ageing_cutoff_days)}d</td>
+        <td>${escapeHTML(r.effective_from || "—")}</td>
+        <td>${chip(r.state, "rule")} ${r.state === "reviewed" ? `<button class="btn btn-small" data-approve-rule="${escapeHTML(r.rule_set_id)}">Approve</button>` : ""}</td>
       `;
       tbody.appendChild(tr);
     });
@@ -242,7 +276,7 @@
           await api(`/v1/rule-versions/${btn.dataset.approveRule}:approve`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ approver: "checker.arvind", effective_from: new Date().toISOString().slice(0, 10) }),
+            body: JSON.stringify({ effective_from: new Date().toISOString().slice(0, 10) }),
           });
           const updated = await api(`/v1/facilities/${activeFacilityId}?period=${activePeriod}`);
           renderRuleVersions(updated.rule_versions);
@@ -260,7 +294,7 @@
     cureTasks.forEach((c) => {
       const tr = document.createElement("tr");
       const when = new Date(c.opened_at).toLocaleDateString();
-      tr.innerHTML = `<td>${c.cure_id}</td><td>${c.test_id}</td><td>${c.period}</td><td>${when}</td><td>${chip(c.status, "evidence")}</td>`;
+      tr.innerHTML = `<td>${escapeHTML(c.cure_id)}</td><td>${escapeHTML(c.test_id)}</td><td>${escapeHTML(c.period)}</td><td>${escapeHTML(when)}</td><td>${chip(c.status, "evidence")}</td>`;
       tbody.appendChild(tr);
     });
   }
@@ -272,11 +306,11 @@
     waivers.forEach((w) => {
       const tr = document.createElement("tr");
       tr.innerHTML = `
-        <td>${w.waiver_id}</td>
-        <td>${w.test_id}</td>
-        <td>${w.scoped_period}${w.expires_after_period ? " – " + w.expires_after_period : ""}</td>
-        <td>${w.submitted_by}</td>
-        <td>${chip(w.state, "evidence")} ${w.state === "reviewed" ? `<button class="btn btn-small" data-approve-waiver="${w.waiver_id}">Approve</button>` : ""}</td>
+        <td>${escapeHTML(w.waiver_id)}</td>
+        <td>${escapeHTML(w.test_id)}</td>
+        <td>${escapeHTML(w.scoped_period)}${escapeHTML(w.expires_after_period ? " – " + w.expires_after_period : "")}</td>
+        <td>${escapeHTML(w.submitted_by)}</td>
+        <td>${chip(w.state, "evidence")} ${w.state === "reviewed" ? `<button class="btn btn-small" data-approve-waiver="${escapeHTML(w.waiver_id)}">Approve</button>` : ""}</td>
       `;
       tbody.appendChild(tr);
     });
@@ -289,7 +323,7 @@
           await api(`/v1/waivers/${btn.dataset.approveWaiver}:approve`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ approver: "credit.suresh" }),
+            body: JSON.stringify({}),
           });
           await renderFacility(facilityId);
         } catch (err) {
@@ -311,12 +345,12 @@
       .map(
         (r) => `
       <div class="renewal-row">
-        <span>${r.review_cycle_period}</span>
+        <span>${escapeHTML(r.review_cycle_period)}</span>
         ${chip(r.decision, "evidence")}
         ${r.decision === "pending" ? `
-          <button class="btn btn-small" data-renew="${r.renewal_id}" data-decision="renewed">Renew</button>
-          <button class="btn btn-small" data-renew="${r.renewal_id}" data-decision="declined">Decline</button>
-        ` : `<span class="loading">decided by ${r.decided_by || "—"}</span>`}
+          <button class="btn btn-small" data-renew="${escapeHTML(r.renewal_id)}" data-decision="renewed">Renew</button>
+          <button class="btn btn-small" data-renew="${escapeHTML(r.renewal_id)}" data-decision="declined">Decline</button>
+        ` : `<span class="loading">decided by ${escapeHTML(r.decided_by || "—")}</span>`}
       </div>`
       )
       .join("");
@@ -326,7 +360,7 @@
         await api(`/v1/renewals/${btn.dataset.renew}:decide`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ decision: btn.dataset.decision, decided_by: "credit.suresh" }),
+          body: JSON.stringify({ decision: btn.dataset.decision }),
         });
         await renderRenewal(facilityId);
       });
@@ -352,7 +386,7 @@
         ([key, label]) => `
       <label class="closure-item">
         <input type="checkbox" data-closure-key="${key}" ${checklist[key] ? "checked" : ""} ${facilityState === "closed" ? "disabled" : ""} />
-        ${label}
+        ${escapeHTML(label)}
       </label>`
       )
       .join("");
@@ -362,7 +396,7 @@
         await api(`/v1/facilities/${facilityId}/closure`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ [input.dataset.closureKey]: input.checked, actor: "ops.rahul" }),
+          body: JSON.stringify({ [input.dataset.closureKey]: input.checked }),
         });
         await renderFacility(facilityId);
       });
@@ -377,7 +411,7 @@
         await api(`/v1/facilities/${facilityId}:close`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ actor: "ops.rahul" }),
+          body: JSON.stringify({}),
         });
         await renderFacility(facilityId);
         await loadFacilities();
@@ -396,11 +430,11 @@
       const tr = document.createElement("tr");
       const canApprove = c.state === "reviewed";
       tr.innerHTML = `
-        <td>${c.case_id}</td>
-        <td>${c.subject_type} · ${c.subject_id}</td>
-        <td>${c.submitted_by}</td>
+        <td>${escapeHTML(c.case_id)}</td>
+        <td>${escapeHTML(c.subject_type)} · ${escapeHTML(c.subject_id)}</td>
+        <td>${escapeHTML(c.submitted_by)}</td>
         <td>${chip(c.state, "evidence")}</td>
-        <td>${canApprove ? `<button class="btn btn-small" data-case="${c.case_id}" data-submitter="${c.submitted_by}">Approve as submitter</button> <button class="btn btn-small" data-case="${c.case_id}" data-submitter="">Approve as checker.arvind</button>` : ""}</td>
+        <td>${canApprove ? `<button class="btn btn-small" data-case="${escapeHTML(c.case_id)}" data-submitter="">Approve with signed-in identity</button>` : ""}</td>
       `;
       tbody.appendChild(tr);
     });
@@ -409,12 +443,11 @@
       btn.addEventListener("click", async () => {
         errorBanner.hidden = true;
         const caseId = btn.dataset.case;
-        const approver = btn.dataset.submitter || "checker.arvind";
         try {
           await api(`/v1/cases/${caseId}:approve`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ approver }),
+            body: JSON.stringify({}),
           });
           await renderCases();
           await renderAudit(activeFacilityId);
@@ -433,7 +466,7 @@
     events.slice(0, 15).forEach((e) => {
       const tr = document.createElement("tr");
       const when = new Date(e.occurred_at).toLocaleString();
-      tr.innerHTML = `<td>${when}</td><td>${e.actor}</td><td>${e.action}</td><td>${e.detail}</td>`;
+      tr.innerHTML = `<td>${escapeHTML(when)}</td><td>${escapeHTML(e.actor)}</td><td>${escapeHTML(e.action)}</td><td>${escapeHTML(e.detail)}</td>`;
       tbody.appendChild(tr);
     });
   }
@@ -449,5 +482,5 @@
     }
   }
 
-  loadFacilities();
+  loadFacilities().catch(err => { accessToken = ""; sessionLabel.textContent = "Sign in failed; use Sign in / switch user"; });
 })();

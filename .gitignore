@@ -7,3 +7,6 @@ __pycache__/
 data/store_snapshot.json
 *.egg-info/
 .DS_Store
+data/
+secrets/
+*.lockfile

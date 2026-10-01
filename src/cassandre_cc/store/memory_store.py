@@ -21,6 +21,7 @@ from cassandre_cc.domain.entities import (
     AuditEvent,
     Borrower,
     ClosureChecklist,
+    CalculationRun,
     CureTask,
     DocumentRef,
     EligibilityRuleSet,
@@ -64,6 +65,7 @@ class MemoryStore:
     evidence_items: dict[str, EvidenceItem] = field(default_factory=dict)
     rule_sets: dict[str, EligibilityRuleSet] = field(default_factory=dict)  # keyed by rule_set_id
     financials: dict[str, FacilityFinancials] = field(default_factory=dict)  # keyed by facility_id:period
+    financials_history: dict[str, FacilityFinancials] = field(default_factory=dict)  # immutable import revisions
     approval_cases: dict[str, ApprovalCase] = field(default_factory=dict)
     import_batches: dict[str, ImportBatch] = field(default_factory=dict)  # keyed by content_hash
     waivers: dict[str, Waiver] = field(default_factory=dict)
@@ -71,6 +73,7 @@ class MemoryStore:
     renewals: dict[str, RenewalRecord] = field(default_factory=dict)
     closures: dict[str, ClosureChecklist] = field(default_factory=dict)  # keyed by facility_id
     feature_snapshots: dict[str, FeatureSnapshot] = field(default_factory=dict)
+    calculation_runs: dict[str, CalculationRun] = field(default_factory=dict)
     audit_events: list[AuditEvent] = field(default_factory=list)
 
     # ---- facilities -----------------------------------------------------
@@ -109,30 +112,48 @@ class MemoryStore:
         versions = [r for r in self.rule_sets.values() if r.facility_id == facility_id]
         return sorted(versions, key=lambda r: r.version)
 
-    def effective_rule_version(self, facility_id: str, period: str) -> Optional[EligibilityRuleSet]:
-        """Spec acceptance scenario #7: "Mid-period amendment: historical
-        test uses old terms, future test uses approved effective version."
+    def effective_rule_on_date(self, facility_id: str, business_date) -> Optional[EligibilityRuleSet]:
+        """Select approved terms on an exact business date; reject ambiguous ties.
 
-        A version that has since been SUPERSEDED by a newer one is still
-        the correct answer for a period that predates the newer version's
-        `effective_from` — supersession means "no longer current," not
-        "never happened." Only versions that were actually approved
-        (`approved_by is not None`) are eligible, and RETIRED versions
-        (explicitly withdrawn, not just superseded) are excluded. Among the
-        eligible versions, the one with the latest `effective_from` that is
-        still on or before the requested period wins."""
-
+        Superseded versions remain eligible for historical replay. Retirement
+        cannot erase historical approval, so approved retired terms remain
+        historical candidates until a replacement takes effect.
+        """
         candidates = [
-            r
-            for r in self.rule_versions_for_facility(facility_id)
+            r for r in self.rule_versions_for_facility(facility_id)
             if r.approved_by is not None
-            and r.state is not ObligationState.RETIRED
+            and r.state in (ObligationState.ACTIVE, ObligationState.SUPERSEDED,
+                            ObligationState.RETIRED)
             and r.effective_from is not None
-            and r.effective_from.isoformat()[:7] <= period
+            and r.effective_from <= business_date
         ]
         if not candidates:
             return None
-        return max(candidates, key=lambda r: r.effective_from)
+        latest = max(r.effective_from for r in candidates)
+        winners = [r for r in candidates if r.effective_from == latest]
+        return winners[0] if len(winners) == 1 else None
+
+    def effective_rule_version(self, facility_id: str, period: str) -> Optional[EligibilityRuleSet]:
+        """Monthly inputs cannot resolve an intra-month amendment.
+
+        Without an explicit calculation business date and agreed period basis,
+        return unknown instead of applying a new mid-month rule retrospectively
+        to the whole month. First-day cutovers retain the existing monthly path.
+        """
+        from datetime import date
+        import re
+
+        if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", period):
+            return None
+        start = date.fromisoformat(period + "-01")
+        if any(
+            r.approved_by is not None and r.effective_from is not None
+            and r.effective_from.isoformat()[:7] == period
+            and r.effective_from.day != 1
+            for r in self.rule_versions_for_facility(facility_id)
+        ):
+            return None
+        return self.effective_rule_on_date(facility_id, start)
 
     # ---- imports (Phase 2) ------------------------------------------------
 
